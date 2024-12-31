@@ -137,14 +137,6 @@ pub fn validate<Permission: Permissions>(
         )));
     }
 
-    // Validate public key type is either Secp256k1 or Ed25519
-    if !(
-        permit.signature.pub_key.r#type == SECP256K1_PUBLIC_KEY_TYPE || 
-        permit.signature.pub_key.r#type == ED25519_PUBLIC_KEY_TYPE
-    ) {
-        return Err(StdError::generic_err("Invalid public key type"));
-    }
-
     // Signature mode
     let mode = permit.signature.mode.clone().unwrap_or(MODE_AMINO.to_string());
 
