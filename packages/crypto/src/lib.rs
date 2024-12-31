@@ -8,7 +8,7 @@ mod rng;
 pub mod secp256k1;
 
 #[cfg(feature = "hash")]
-pub use hash::{sha_256, SHA256_HASH_SIZE};
+pub use hash::{sha_256, SHA256_HASH_SIZE, keccak_256, KECCAK256_HASH_SIZE};
 
 #[cfg(feature = "rand")]
 pub use rng::ContractPrng;

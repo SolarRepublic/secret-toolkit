@@ -9,6 +9,34 @@ use cosmwasm_std::{Binary, CanonicalAddr, Uint128};
 pub const BLANKET_PERMIT_TOKEN: &str = "ANY_TOKEN";
 pub const REVOKED_ALL: &str = "REVOKED_ALL";
 
+pub const MODE_AMINO: &str = "amino";
+pub const MODE_ADR_036: &str = "adr-036";
+pub const MODE_EIP_712: &str = "eip-712";
+
+/// EIP-712 permit params typehash
+/// PERMIT_PARAMS_TYPEHASH := keccack256("Snip24PermitParams(string permit_name,string[] allowed_tokens,string[] permissions,string created,string expires)")
+/// `# ==> 0x156a194f7ab977bb05ec4e69ebb93692100868a082ba66b17131cbab1745ffca`
+pub const EIP_712_PERMIT_PARAMS_TYPEHASH: [u8; 32] = [
+    0x15, 0x6a, 0x19, 0x4f, 0x7a, 0xb9, 0x77, 0xbb, 0x05, 0xec, 
+    0x4e, 0x69, 0xeb, 0xb9, 0x36, 0x92, 0x10, 0x08, 0x68, 0xa0,
+    0x82, 0xba, 0x66, 0xb1, 0x71, 0x31, 0xcb, 0xab, 0x17, 0x45,
+    0xff, 0xca
+];
+
+/// EIP-712 permit msg typehash
+/// PERMIT_MSG_TYPEHASH := keccack256("Snip24PermitMsg(string chain_id,Snip24PermitParams)")
+/// `# ==> 0xa97869de207379729fdfc6f8d6822524cd2fd88db433fc310f787b0d710ae3c2``
+pub const EIP_712_PERMIT_MSG_TYPEHASH: [u8; 32] = [
+    0xa9, 0x78, 0x69, 0xde, 0x20, 0x73, 0x79, 0x72, 0x9f, 0xdf,
+    0xc6, 0xf8, 0xd6, 0x82, 0x25, 0x24, 0xcd, 0x2f, 0xd8, 0x8d,
+    0xb4, 0x33, 0xfc, 0x31, 0x0f, 0x78, 0x7b, 0x0d, 0x71, 0x0a,
+    0xe3, 0xc2
+];
+
+/// Public key types
+pub const SECP256K1_PUBLIC_KEY_TYPE: &str = "tendermint/PubKeySecp256k1";
+pub const ED25519_PUBLIC_KEY_TYPE: &str = "tendermint/PubKeyEd25519";
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct Permit<Permission: Permissions = TokenPermissions> {
@@ -43,15 +71,21 @@ pub struct PermitParams<Permission: Permissions = TokenPermissions> {
 #[serde(rename_all = "snake_case")]
 pub struct PermitSignature {
     pub pub_key: PubKey,
+    /// either 64-byte or 65-byte (R, S, V) format
     pub signature: Binary,
+    /// optional signing mode field:
+    /// * `"amino"` the original SNIP-24 sign mode (same as omitting `mode`)
+    /// * `"adr-036"` for ADR-036
+    /// * `"eip-712"` for EIP-712
+    pub mode: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct PubKey {
-    /// ignored, but must be "tendermint/PubKeySecp256k1" otherwise the verification will fail
+    /// must be "tendermint/PubKeySecp256k1" or "tendermint/PubKeyEd25519" otherwise the verification will fail
     pub r#type: String,
-    /// Secp256k1 PubKey
+    /// Secp256k1 PubKey or Ed25519 PubKey
     pub value: Binary,
 }
 
@@ -65,7 +99,7 @@ impl PubKey {
 #[remain::sorted]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub struct SignedPermit<Permission: Permissions = TokenPermissions> {
+pub struct AminoSignedPermit<Permission: Permissions = TokenPermissions> {
     /// ignored
     pub account_number: Uint128,
     /// ignored, no Env in query
@@ -81,7 +115,7 @@ pub struct SignedPermit<Permission: Permissions = TokenPermissions> {
     pub sequence: Uint128,
 }
 
-impl<Permission: Permissions> SignedPermit<Permission> {
+impl<Permission: Permissions> AminoSignedPermit<Permission> {
     pub fn from_params(params: &PermitParams<Permission>) -> Self {
         Self {
             account_number: Uint128::zero(),
@@ -219,3 +253,43 @@ pub enum TokenPermissions {
     /// address will view the data by creating their own permit with Owner permission
     Owner,
 }
+
+/* Example EIP-712 payload
+
+{
+  "types": {
+    "EIP712Domain": [
+      { "name": "name", "type": "string" },
+      { "name": "version", "type": "string" },
+      { "name": "chainId", "type": "uint256" },
+      { "name": "salt", "type": "bytes32" }
+    ],
+    "Snip24PermitParams": [
+      { "name": "permit_name", "type": "string" },
+      { "name": "allowed_tokens", "type": "string[]" },
+      { "name": "permissions", "type": "string[]" },
+      { "name": "created", "type": "string" },
+      { "name": "expires", "type": "string" }
+    ],
+    "Snip24PermitMsg": [
+      { "name": "chain_id", "type": "string" },
+      { "name": "params", "Snip24PermitParams" }
+    ]
+  },
+  "primaryType": "Snip24PermitMsg",
+  "domain": {
+    "name": "My App",
+    "version": "1",
+  },
+  "message": {
+    "chain_id": "secret-4",
+    "params": {
+      "permit_name": "my permit",
+      "allowed_tokens": ["ANY_TOKEN"],
+      "permissions": ["balance"],
+      "created": "2025-01-01T00:04:20.691Z"
+    }
+  }
+}
+
+*/

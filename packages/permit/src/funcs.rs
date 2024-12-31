@@ -2,11 +2,11 @@ use std::u64;
 
 use cosmwasm_std::{to_binary, Binary, CanonicalAddr, Deps, Env, StdError, StdResult, Uint64};
 use ripemd::{Digest, Ripemd160};
-use secret_toolkit_utils::iso8601_utc0_to_timestamp;
+use secret_toolkit_utils::iso8601_utc0_to_seconds;
 
-use crate::{Permissions, Permit, RevokedPermits, RevokedPermitsStore, SignedPermit, BLANKET_PERMIT_TOKEN};
+use crate::{Permissions, Permit, RevokedPermits, RevokedPermitsStore, AminoSignedPermit, BLANKET_PERMIT_TOKEN, ED25519_PUBLIC_KEY_TYPE, EIP_712_PERMIT_PARAMS_TYPEHASH, MODE_ADR_036, MODE_AMINO, MODE_EIP_712, SECP256K1_PUBLIC_KEY_TYPE};
 use bech32::{ToBase32, Variant};
-use secret_toolkit_crypto::sha_256;
+use secret_toolkit_crypto::{keccak_256, secp256k1::{PublicKey, COMPRESSED_PUBLIC_KEY_SIZE, PUBLIC_KEY_SIZE}, sha_256, KECCAK256_HASH_SIZE};
 
 pub fn validate<Permission: Permissions>(
     deps: Deps,
@@ -46,13 +46,13 @@ pub fn validate<Permission: Permissions>(
     // Convert the permit created field to a Timestamp
     let created_timestamp = permit.params.created.clone()
         .map(|created| 
-            iso8601_utc0_to_timestamp(&created)
+            iso8601_utc0_to_seconds(&created)
         )
         .transpose()?;
 
     if let Some(created) = created_timestamp {
         // Verify that the permit was not created after the current block time
-        if created.seconds() > env.block.time.seconds() {
+        if created > env.block.time.seconds() {
             return Err(StdError::generic_err("Permit `created` after current block time"));
         }
     }
@@ -60,22 +60,39 @@ pub fn validate<Permission: Permissions>(
     // Convert the permit expires field to a Timestamp
     let expires_timestamp = permit.params.expires.clone()
         .map(|created| 
-            iso8601_utc0_to_timestamp(&created)
+            iso8601_utc0_to_seconds(&created)
         )
         .transpose()?;
 
+    // Verify that the permit did not expire before the current block time
     if let Some(expires) = expires_timestamp {
-        // Verify that the permit did not expire before the current block time
-        if expires.seconds() <= env.block.time.seconds() {
+        if expires <= env.block.time.seconds() {
             return Err(StdError::generic_err("Permit has expired"))
         }
     }
 
-    // Derive account from pubkey
+    // Get public key value
     let pubkey = &permit.signature.pub_key.value;
 
-    let base32_addr = pubkey_to_account(pubkey).0.as_slice().to_base32();
-    let account: String = bech32::encode(account_hrp, base32_addr, Variant::Bech32).unwrap();
+    // Derive account from public key based on the number of bytes
+    let account = match pubkey.0.len() {
+        // public key is 33 bytes
+        COMPRESSED_PUBLIC_KEY_SIZE => {
+            let base32_addr = pubkey_to_account(pubkey).0.as_slice().to_base32();
+            bech32::encode(account_hrp, base32_addr, Variant::Bech32).unwrap()
+        }
+
+        // public key is 65 bytes
+        PUBLIC_KEY_SIZE => {
+            // convert uncompressed public key (65 bytes) to compressed (33 bytes)
+            let compressed = PublicKey::parse(&pubkey.0)?.serialize_compressed();
+            let base32_addr = pubkey_to_account(&Binary(compressed.into())).0.as_slice().to_base32();
+            bech32::encode(account_hrp, base32_addr, Variant::Bech32).unwrap()
+        }
+        _ => {
+            return Err(StdError::generic_err("Public key len is not 33 or 65 bytes"))
+        }
+    };
 
     // Get the list of all revocations for this address
     let revocations = RevokedPermits::list_revocations(deps.storage, &account)?;
@@ -100,7 +117,7 @@ pub fn validate<Permission: Permissions>(
             let created_after = revocation.interval.created_after.unwrap_or(Uint64::from(u64::MAX));
 
             // If the permit's `created` field falls in between created after and created before, then reject it
-            if created.seconds() > created_after.u64() || created.seconds() < created_before.u64() {
+            if created > created_after.u64() || created < created_before.u64() {
                 return Err(StdError::generic_err(
                     format!("Permits created at {:?} revoked by account {:?}", created, account.as_str())
                 ));                
@@ -120,14 +137,78 @@ pub fn validate<Permission: Permissions>(
         )));
     }
 
-    // Validate signature, reference: https://github.com/enigmampc/SecretNetwork/blob/f591ed0cb3af28608df3bf19d6cfb733cca48100/cosmwasm/packages/wasmi-runtime/src/crypto/secp256k1.rs#L49-L82
-    let signed_bytes = to_binary(&SignedPermit::from_params(&permit.params))?;
-    let signed_bytes_hash = sha_256(signed_bytes.as_slice());
+    // Validate public key type is either Secp256k1 or Ed25519
+    if !(
+        permit.signature.pub_key.r#type == SECP256K1_PUBLIC_KEY_TYPE || 
+        permit.signature.pub_key.r#type == ED25519_PUBLIC_KEY_TYPE
+    ) {
+        return Err(StdError::generic_err("Invalid public key type"));
+    }
 
-    let verified = deps
-        .api
-        .secp256k1_verify(&signed_bytes_hash, &permit.signature.signature.0, &pubkey.0)
-        .map_err(|err| StdError::generic_err(err.to_string()))?;
+    // Signature mode
+    let mode = permit.signature.mode.clone().unwrap_or(MODE_AMINO.to_string());
+
+    // Derive the signed bytes hash based on the mode provided
+    let signed_bytes_hash = match mode.as_str() {
+        MODE_AMINO => {
+            // Validate signature, reference: https://github.com/enigmampc/SecretNetwork/blob/f591ed0cb3af28608df3bf19d6cfb733cca48100/cosmwasm/packages/wasmi-runtime/src/crypto/secp256k1.rs#L49-L82
+            let signed_bytes = to_binary(&AminoSignedPermit::from_params(&permit.params))?;
+            sha_256(signed_bytes.as_slice())
+        },
+        MODE_EIP_712 => {
+            // Create a buffer to store concatenated permission hashes
+            let mut concatenated_permission_hashes: Vec<u8> = Vec::with_capacity(permit.params.permissions.len() * KECCAK256_HASH_SIZE);
+
+            for permission in permit.params.permissions.clone() {
+                // Serialize each permission to JSON
+                let json = serde_json::to_string(&permission).unwrap();
+
+                // Hash the serialized JSON
+                let hash = keccak_256(json.as_bytes());
+
+                // Append the hash to the buffer
+                concatenated_permission_hashes.extend_from_slice(&hash);
+            }
+
+            // Construct permit params hash
+            let permit_params_hash = [
+                EIP_712_PERMIT_PARAMS_TYPEHASH,
+                keccak_256(permit.params.permit_name.as_bytes()),
+                keccak_256(&keccak_256(BLANKET_PERMIT_TOKEN.as_bytes())),
+                keccak_256(&concatenated_permission_hashes),
+                keccak_256(permit.params.created.clone().unwrap_or_default().as_bytes()),
+                keccak_256(permit.params.expires.clone().unwrap_or_default().as_bytes()),
+            ].concat();
+
+            // Construct permit msg hash
+            let permit_msg_hash = [
+                keccak_256(permit.params.chain_id.as_bytes()).as_slice(),
+                permit_params_hash.as_slice(),
+            ].concat();
+
+            sha_256(&permit_msg_hash)
+        },
+        MODE_ADR_036 => {
+            return Err(StdError::generic_err("TODO: ADR-036 signing not implemented"));
+        },
+        _ => {
+            return Err(StdError::generic_err("Invalid signing mode"));
+        }
+    };
+
+    let verified = match permit.signature.pub_key.r#type.as_str() {
+        SECP256K1_PUBLIC_KEY_TYPE => deps
+            .api
+            .secp256k1_verify(&signed_bytes_hash, &permit.signature.signature.0, &pubkey.0)
+            .map_err(|err| StdError::generic_err(err.to_string()))?,
+        ED25519_PUBLIC_KEY_TYPE => deps
+            .api
+            .ed25519_verify(&signed_bytes_hash, &permit.signature.signature.0, &pubkey.0)
+            .map_err(|err| StdError::generic_err(err.to_string()))?,
+        _ => {
+            return Err(StdError::generic_err("Invalid signature public key type"));
+        }
+    };
 
     if !verified {
         return Err(StdError::generic_err(
@@ -173,7 +254,8 @@ mod tests {
                     value: Binary::from_base64("A5M49l32ZrV+SDsPnoRv8fH7ivNC4gEX9prvd4RwvRaL").unwrap(),
 
                 },
-                signature: Binary::from_base64("hw/Mo3ZZYu1pEiDdymElFkuCuJzg9soDHw+4DxK7cL9rafiyykh7VynS+guotRAKXhfYMwCiyWmiznc6R+UlsQ==").unwrap()                
+                signature: Binary::from_base64("hw/Mo3ZZYu1pEiDdymElFkuCuJzg9soDHw+4DxK7cL9rafiyykh7VynS+guotRAKXhfYMwCiyWmiznc6R+UlsQ==").unwrap(),
+                mode: None,            
             }
         };
 
@@ -234,7 +316,8 @@ mod tests {
                     r#type: "tendermint/PubKeySecp256k1".to_string(),
                     value: Binary::from_base64("AwSFyMndr25JX03rGSlXQ5oSO6F+9GoqQILZu/DytRrr").unwrap(),
                 },
-                signature: Binary::from_base64("mFDn5w59gaDTHZ5UzEA6l+sUOtlWDx/HcSi1NpZM13YuamMehIi3mseqXcQy4loE63N0hYhyXiVZdzrPM28A+g==").unwrap()
+                signature: Binary::from_base64("mFDn5w59gaDTHZ5UzEA6l+sUOtlWDx/HcSi1NpZM13YuamMehIi3mseqXcQy4loE63N0hYhyXiVZdzrPM28A+g==").unwrap(),
+                mode: None,
             }
         };
 
@@ -316,7 +399,8 @@ mod tests {
                     r#type: "tendermint/PubKeySecp256k1".to_string(),
                     value: Binary::from_base64("AwSFyMndr25JX03rGSlXQ5oSO6F+9GoqQILZu/DytRrr").unwrap(),
                 },
-                signature: Binary::from_base64("Qte1iS54RsyRCN3rmOjA96yXQTn+eg4YaEUAU/Q5mLVGU9mOCEw6LMZjU2owLB4ogcziWrMkLOL3dtOrj3dL4Q==").unwrap()
+                signature: Binary::from_base64("Qte1iS54RsyRCN3rmOjA96yXQTn+eg4YaEUAU/Q5mLVGU9mOCEw6LMZjU2owLB4ogcziWrMkLOL3dtOrj3dL4Q==").unwrap(),
+                mode: None,
             }
         };
 
@@ -392,7 +476,8 @@ mod tests {
                     r#type: "tendermint/PubKeySecp256k1".to_string(),
                     value: Binary::from_base64("AwSFyMndr25JX03rGSlXQ5oSO6F+9GoqQILZu/DytRrr").unwrap(),
                 },
-                signature: Binary::from_base64("vc36PM85beBIOmimreAD428O3ldyyUqNHxmzUYlsHaJ+560Ce8G5ibJR7KCvHJitRuds/3TvGX4dPp6l6xfrUg==").unwrap()
+                signature: Binary::from_base64("vc36PM85beBIOmimreAD428O3ldyyUqNHxmzUYlsHaJ+560Ce8G5ibJR7KCvHJitRuds/3TvGX4dPp6l6xfrUg==").unwrap(),
+                mode: None,
             }
         };
 
@@ -432,7 +517,8 @@ mod tests {
                     r#type: "tendermint/PubKeySecp256k1".to_string(),
                     value: Binary::from_base64("AwSFyMndr25JX03rGSlXQ5oSO6F+9GoqQILZu/DytRrr").unwrap(),
                 },
-                signature: Binary::from_base64("k2tdjChWUeIfs63qcHwzUdt1C92gQ5lwvEPS4fv7GpM2geaWGpUsy6Ne+m0pda0AJEpdbiZ38KjiKNlU3CmkOw==").unwrap()
+                signature: Binary::from_base64("k2tdjChWUeIfs63qcHwzUdt1C92gQ5lwvEPS4fv7GpM2geaWGpUsy6Ne+m0pda0AJEpdbiZ38KjiKNlU3CmkOw==").unwrap(),
+                mode: None,
             }
         };
 
